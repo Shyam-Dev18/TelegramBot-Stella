@@ -878,19 +878,62 @@ async def error_handler(_: Client, message: Message):
     pass
 
 
+# ----------------- HEALTH CHECK SERVER FOR RENDER -----------------
+
+async def health_check(request):
+    """Health check endpoint for uptime monitoring."""
+    return web.Response(text="Bot is running!", status=200)
+
+
+async def run_health_server():
+    """Run aiohttp web server for health checks (Render requirement)."""
+    app_web = web.Application()
+    app_web.router.add_get('/', health_check)
+    app_web.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    
+    # Render provides PORT env variable
+    port = int(os.getenv('PORT', 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    LOGGER.info("✅ Health check server started on 0.0.0.0:%d", port)
+    LOGGER.info("✅ Health endpoints: / and /health")
+    
+    # Keep the server running indefinitely
+    while True:
+        await asyncio.sleep(3600)  # Sleep for 1 hour, repeat forever
+
+
 # ----------------- MAIN -----------------
+
+async def start_bot():
+    """Start the bot and health check server."""
+    load_channels()
+    
+    LOGGER.info("=" * 50)
+    LOGGER.info("Bot starting...")
+    LOGGER.info("API_ID: %s", API_ID)
+    LOGGER.info("Channels loaded: %d users", len(channels_data))
+    LOGGER.info("=" * 50)
+    
+    # Start the Pyrogram client
+    await app.start()
+    LOGGER.info("✅ Pyrogram client started!")
+    
+    # Run health server and idle concurrently
+    await asyncio.gather(
+        run_health_server(),  # Health check server
+        idle()                # Keep bot running
+    )
+
 
 def main():
     """Main entry point."""
     try:
-        load_channels()
-        LOGGER.info("=" * 50)
-        LOGGER.info("Bot starting...")
-        LOGGER.info("API_ID: %s", API_ID)
-        LOGGER.info("Channels loaded: %d users", len(channels_data))
-        LOGGER.info("=" * 50)
-        
-        app.run()
+        app.run(start_bot())
         
     except KeyboardInterrupt:
         LOGGER.info("Bot stopped by user")
