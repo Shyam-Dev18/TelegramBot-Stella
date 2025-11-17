@@ -1,0 +1,21 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Bot data
+channels.json
+controller_like_bot.session
+bot.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
