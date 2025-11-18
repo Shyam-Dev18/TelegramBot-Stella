@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import signal
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -878,11 +879,40 @@ async def error_handler(_: Client, message: Message):
     pass
 
 
+# ----------------- GRACEFUL SHUTDOWN HANDLER -----------------
+
+# Global flag for shutdown
+is_shutting_down = False
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global is_shutting_down
+    signal_name = signal.Signals(signum).name
+    LOGGER.warning(f"⚠️ Received {signal_name} signal. Initiating graceful shutdown...")
+    is_shutting_down = True
+
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)  # Render sends this
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+
+
 # ----------------- HEALTH CHECK SERVER FOR RENDER -----------------
 
 async def health_check(request):
     """Health check endpoint for uptime monitoring."""
-    return web.Response(text="Bot is running!", status=200)
+    if is_shutting_down:
+        return web.Response(text="Shutting down...", status=503)
+    
+    # Check if bot is actually connected
+    try:
+        if app.is_connected:
+            return web.Response(text="Bot is running!", status=200)
+        else:
+            return web.Response(text="Bot disconnected", status=503)
+    except Exception as e:
+        LOGGER.error("Health check error: %s", e)
+        return web.Response(text=f"Error: {str(e)}", status=500)
 
 
 async def run_health_server():
@@ -902,46 +932,91 @@ async def run_health_server():
     LOGGER.info("✅ Health check server started on 0.0.0.0:%d", port)
     LOGGER.info("✅ Health endpoints: / and /health")
     
-    # Keep the server running indefinitely
-    while True:
-        await asyncio.sleep(3600)  # Sleep for 1 hour, repeat forever
+    # Keep the server running, check for shutdown signal
+    try:
+        while not is_shutting_down:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        LOGGER.info("🛑 Shutting down health check server...")
+        await runner.cleanup()
 
 
 # ----------------- MAIN -----------------
 
 async def start_bot():
     """Start the bot and health check server."""
-    load_channels()
+    global is_shutting_down
     
-    LOGGER.info("=" * 50)
-    LOGGER.info("Bot starting...")
-    LOGGER.info("API_ID: %s", API_ID)
-    LOGGER.info("Channels loaded: %d users", len(channels_data))
-    LOGGER.info("=" * 50)
-    
-    # Start the Pyrogram client
-    await app.start()
-    LOGGER.info("✅ Pyrogram client started!")
-    
-    # Run health server and idle concurrently
-    await asyncio.gather(
-        run_health_server(),  # Health check server
-        idle()                # Keep bot running
-    )
+    try:
+        load_channels()
+        
+        LOGGER.info("=" * 50)
+        LOGGER.info("🚀 Bot starting...")
+        LOGGER.info("API_ID: %s", API_ID)
+        LOGGER.info("Channels loaded: %d users", len(channels_data))
+        LOGGER.info("=" * 50)
+        
+        # Start health server FIRST (so Render sees port immediately)
+        health_task = asyncio.create_task(run_health_server())
+        
+        # Wait a bit for health server to bind
+        await asyncio.sleep(2)
+        LOGGER.info("✅ Health server confirmed running")
+        
+        # Now start the Pyrogram client
+        LOGGER.info("🔌 Starting Pyrogram client...")
+        await app.start()
+        LOGGER.info("✅ Pyrogram client connected!")
+        
+        LOGGER.info("🎉 Bot is fully operational!")
+        
+        # Wait for shutdown signal
+        while not is_shutting_down:
+            await asyncio.sleep(1)
+        
+        # Graceful shutdown
+        LOGGER.info("🛑 Initiating graceful shutdown...")
+        
+        # Cancel health server
+        health_task.cancel()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
+        
+        # Stop Pyrogram client
+        LOGGER.info("🛑 Stopping Pyrogram client...")
+        await app.stop()
+        
+        LOGGER.info("✅ Shutdown complete!")
+        
+    except Exception as e:
+        LOGGER.critical("❌ FATAL ERROR in start_bot: %s", e, exc_info=True)
+        raise
 
 
 def main():
     """Main entry point."""
+    exit_code = 0
+    
     try:
-        app.run(start_bot())
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(start_bot())
         
     except KeyboardInterrupt:
-        LOGGER.info("Bot stopped by user")
+        LOGGER.info("🛑 Bot stopped by user (Ctrl+C)")
+        exit_code = 0  # Graceful shutdown
     except Exception as e:
-        LOGGER.critical("Fatal error: %s", e, exc_info=True)
-        raise
+        LOGGER.critical("❌ Fatal error: %s", e, exc_info=True)
+        exit_code = 1  # Error - should restart
     finally:
-        LOGGER.info("Bot shutdown complete")
+        LOGGER.info("👋 Bot shutdown complete")
+        
+    # Return exit code for start.sh to handle
+    import sys
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
