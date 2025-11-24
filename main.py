@@ -1,1023 +1,1369 @@
 import os
-import json
+import signal
 import logging
 import asyncio
-import signal
-from pathlib import Path
-from typing import Dict, Any, List, Optional
+import secrets
+import string
+from datetime import datetime
 
-from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatType
-from pyrogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from pyrogram.errors import (
-    ChatAdminRequired,
-    ChannelPrivate,
-    PeerIdInvalid,
-    FloodWait,
-    UserIsBlocked,
-)
+# Network and Web Server
 from aiohttp import web
 
-# ----------------- CONFIG & LOGGING -----------------
+# Database
+import motor.motor_asyncio
 
+# Telegram Bot Library
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    Message, 
+    CallbackQuery
+)
+from pyrogram.errors import (
+    UserNotParticipant, 
+    ChatAdminRequired, 
+    ChannelPrivate,
+    FloodWait,
+    MessageNotModified
+)
+
+# Environment Variables
+from dotenv import load_dotenv
+
+# --------------------------------------------------------------------------
+# CONFIGURATION & SETUP
+# --------------------------------------------------------------------------
+
+# Load .env file
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
-if not API_ID or not API_HASH or not BOT_TOKEN:
-    raise RuntimeError("Please set API_ID, API_HASH and BOT_TOKEN in .env file")
-
+# Logging setup (helps debug issues on Render logs)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-LOGGER = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
+# Get variables from environment
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", 0))
+MONGO_URL = os.getenv("MONGO_URL")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+PORT = int(os.getenv("PORT", 10000))
+
+# --------------------------------------------------------------------------
+# DATABASE CONNECTION (MongoDB)
+# --------------------------------------------------------------------------
+
+# Connect to Mongo
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
+db = mongo_client[MONGO_DB_NAME]
+
+# Collections
+must_join_channels_col = db["must_join_channels"]   # Stores channels for FSub (user must join)
+post_channels_col = db["post_channels"]             # Stores channels where bot posts content
+fileshares_col = db["fileshares"]                   # Stores file links
+
+# --------------------------------------------------------------------------
+# BOT INITIALIZATION
+# --------------------------------------------------------------------------
+
+# Initialize Pyrogram Client
 app = Client(
-    "controller_like_bot",
+    "my_render_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True  # Good for ephemeral filesystems like Render
 )
 
-# ----------------- SIMPLE STORAGE -----------------
+# --------------------------------------------------------------------------
+# STATE MANAGEMENT (MEMORY)
+# --------------------------------------------------------------------------
 
-DATA_FILE = Path(__file__).parent / "channels.json"
+# Since this is a simple bot, we store wizard states in Python dictionaries.
+# If the bot restarts, these current edit sessions are lost (persistent data is in Mongo).
 
-# channels_data = { "user_id(str)": [ { "id": int, "title": str } ] }
-channels_data: Dict[str, List[Dict[str, Any]]] = {}
+# user_states stores what step the admin is on (e.g., "WAITING_FOR_CHANNEL_INPUT")
+user_states = {} 
 
+# post_cache stores the post the admin is currently building (Text, Media, Buttons)
+post_cache = {}
 
-def load_channels() -> None:
-    """Load channels data from JSON file."""
-    global channels_data
-    if DATA_FILE.exists():
-        try:
-            with DATA_FILE.open("r", encoding="utf-8") as f:
-                channels_data = json.load(f)
-            LOGGER.info("Loaded %d user channel lists", len(channels_data))
-        except json.JSONDecodeError as e:
-            LOGGER.error("Invalid JSON in channels.json: %s", e)
-            channels_data = {}
-        except Exception as e:
-            LOGGER.error("Error loading channels.json: %s", e)
-            channels_data = {}
-    else:
-        channels_data = {}
-        LOGGER.info("No existing channels.json found, starting fresh")
+# --------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------------------------------
 
+def generate_random_token(length=8):
+    """Generates a random string for deep linking."""
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def save_channels() -> None:
-    """Save channels data to JSON file."""
+async def is_user_member(user_id, channel_id):
+    """Checks if a user is a member of a specific channel."""
     try:
-        with DATA_FILE.open("w", encoding="utf-8") as f:
-            json.dump(channels_data, f, indent=2, ensure_ascii=False)
-        LOGGER.debug("Channels saved successfully")
-    except Exception as e:
-        LOGGER.error("Error saving channels.json: %s", e)
-
-
-def get_user_channels(user_id: int) -> List[Dict[str, Any]]:
-    """Get list of channels for a specific user."""
-    return channels_data.get(str(user_id), [])
-
-
-def add_user_channel(user_id: int, chat_id: int, title: str) -> bool:
-    """Add a channel to user's list. Returns True if added, False if already exists."""
-    uid = str(user_id)
-    user_list = channels_data.setdefault(uid, [])
-    
-    # Check if channel already exists
-    for c in user_list:
-        if c["id"] == chat_id:
-            LOGGER.info("Channel %s already exists for user %s", chat_id, user_id)
+        member = await app.get_chat_member(channel_id, user_id)
+        if member.status in [enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT]:
             return False
-    
-    user_list.append({"id": chat_id, "title": title})
-    save_channels()
-    LOGGER.info("Added channel %s (%s) for user %s", title, chat_id, user_id)
-    return True
+        return True
+    except UserNotParticipant:
+        return False
+    except Exception as e:
+        logger.error(f"Error checking membership: {e}")
+        # If bot can't check (e.g. kicked), assume False to be safe
+        return False
 
+def get_cancel_button(callback_data="admin_cancel_action"):
+    """Returns a standardized Cancel button."""
+    return InlineKeyboardButton("❌ Cancel", callback_data=callback_data)
 
-def remove_user_channel(user_id: int, chat_id: int) -> bool:
-    """Remove a channel from user's list. Returns True if removed, False if not found."""
-    uid = str(user_id)
-    user_list = channels_data.get(uid, [])
-    
-    for i, c in enumerate(user_list):
-        if c["id"] == chat_id:
-            removed = user_list.pop(i)
-            save_channels()
-            LOGGER.info("Removed channel %s for user %s", chat_id, user_id)
-            return True
-    
-    return False
+def get_back_button(callback_data="admin_back_main"):
+    """Returns a standardized Back button."""
+    return InlineKeyboardButton("🔙 Back", callback_data=callback_data)
 
-
-# ----------------- SESSION STATE -----------------
-
-# session[user_id] = { "state": str, "post": {...}, "tmp_button_text": str }
-sessions: Dict[int, Dict[str, Any]] = {}
-
-
-def get_session(user_id: int) -> Dict[str, Any]:
-    """Get or create session for a user."""
-    if user_id not in sessions:
-        sessions[user_id] = {
-            "state": "idle",
-            "post": None,
-            "tmp_button_text": None
-        }
-    return sessions[user_id]
-
-
-def reset_session(user_id: int) -> None:
-    """Reset user session to idle state."""
-    sessions[user_id] = {
-        "state": "idle",
-        "post": None,
-        "tmp_button_text": None
-    }
-    LOGGER.debug("Reset session for user %s", user_id)
-
-
-# ----------------- KEYBOARDS -----------------
-
-def main_menu() -> InlineKeyboardMarkup:
-    """Main menu keyboard."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 New Post", callback_data="menu_new_post")],
-        [InlineKeyboardButton("📡 Add Channel", callback_data="menu_add_channel")],
-        [InlineKeyboardButton("🗑️ Remove Channel", callback_data="menu_remove_channel")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")],
-    ])
-
-
-def cancel_keyboard() -> InlineKeyboardMarkup:
-    """Simple cancel button keyboard."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")]
-    ])
-
-
-def add_button_or_skip_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard for adding buttons or skipping."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Button", callback_data="post_add_button")],
-        [InlineKeyboardButton("➡️ Skip Buttons", callback_data="post_skip_buttons")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")],
-    ])
-
-
-def done_more_buttons_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard for adding more buttons or finishing."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Another Button", callback_data="post_add_button")],
-        [InlineKeyboardButton("✅ Done", callback_data="post_done_buttons")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")],
-    ])
-
-
-def channel_select_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Keyboard for selecting target channel(s)."""
-    user_channels = get_user_channels(user_id)
-    rows: List[List[InlineKeyboardButton]] = []
-
-    if not user_channels:
-        rows.append([InlineKeyboardButton("⚠️ No channels added yet", callback_data="noop")])
-    else:
-        for ch in user_channels:
-            rows.append([
-                InlineKeyboardButton(
-                    ch["title"],
-                    callback_data=f"target_channel:{ch['id']}",
-                )
-            ])
-        if len(user_channels) > 1:
-            rows.append([InlineKeyboardButton("📤 Post to ALL Channels", callback_data="target_all")])
-
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def channel_remove_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Keyboard for selecting channel to remove."""
-    user_channels = get_user_channels(user_id)
-    rows: List[List[InlineKeyboardButton]] = []
-
-    if not user_channels:
-        rows.append([InlineKeyboardButton("⚠️ No channels to remove", callback_data="noop")])
-    else:
-        for ch in user_channels:
-            rows.append([
-                InlineKeyboardButton(
-                    f"🗑️ {ch['title']}",
-                    callback_data=f"remove_channel:{ch['id']}",
-                )
-            ])
-
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="menu_cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_buttons_markup(post: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
-    """Build inline keyboard from post buttons."""
-    buttons = post.get("buttons") or []
+def format_button_markup(buttons):
+    """Format buttons: 2 per row, single button takes full width."""
     if not buttons:
         return None
-    rows = [[InlineKeyboardButton(text=b["text"], url=b["url"])] for b in buttons]
-    return InlineKeyboardMarkup(rows)
-
-
-# ----------------- COMMAND HANDLERS -----------------
-
-@app.on_message(filters.command("start") & filters.private)
-async def cmd_start(_: Client, message: Message):
-    """Handle /start command."""
-    reset_session(message.from_user.id)
-    LOGGER.info("User %s started the bot", message.from_user.id)
     
-    await message.reply_text(
-        "👋 **Welcome to Channel Controller Bot!**\n\n"
-        "This bot lets you:\n"
-        "• Add channels where the bot is admin\n"
-        "• Create posts (text/photo/video)\n"
-        "• Add inline buttons to posts\n"
-        "• Send to one or all channels\n\n"
-        "Choose an option below to get started:",
-        reply_markup=main_menu(),
-    )
-
-
-@app.on_message(filters.command("cancel") & filters.private)
-async def cmd_cancel(_: Client, message: Message):
-    """Handle /cancel command."""
-    reset_session(message.from_user.id)
-    LOGGER.info("User %s cancelled action", message.from_user.id)
-    await message.reply_text("✅ Current action cancelled.", reply_markup=main_menu())
-
-
-@app.on_message(filters.command("help") & filters.private)
-async def cmd_help(_: Client, message: Message):
-    """Handle /help command."""
-    await message.reply_text(
-        "**📖 How to use this bot:**\n\n"
-        "**1️⃣ Add a Channel**\n"
-        "   • Make sure the bot is admin in your channel\n"
-        "   • Forward any message from that channel to the bot\n"
-        "   • Or send the channel username (@username) or link\n\n"
-        "**2️⃣ Create a Post**\n"
-        "   • Choose 'New Post'\n"
-        "   • Send text, photo, or video\n"
-        "   • Optionally add inline buttons\n"
-        "   • Select target channel(s)\n\n"
-        "**3️⃣ Remove a Channel**\n"
-        "   • Choose 'Remove Channel'\n"
-        "   • Select the channel to remove\n\n"
-        "**Commands:**\n"
-        "/start - Show main menu\n"
-        "/cancel - Cancel current action\n"
-        "/help - Show this help message",
-        reply_markup=main_menu(),
-    )
-
-
-# ----------------- PRIVATE MESSAGE HANDLER (STATES) -----------------
-
-@app.on_message(filters.private & ~filters.command(["start", "cancel", "help"]))
-async def private_messages(client: Client, message: Message):
-    """Handle all private messages based on user state."""
-    user_id = message.from_user.id
-    session = get_session(user_id)
-    state = session["state"]
-
-    LOGGER.debug("User %s in state '%s' sent message", user_id, state)
-
-    if state == "await_channel_forward":
-        await handle_channel_forward(client, message, session)
-    elif state == "await_post_content":
-        await handle_post_content(client, message, session)
-    elif state == "await_button_text":
-        await handle_button_text(client, message, session)
-    elif state == "await_button_url":
-        await handle_button_url(client, message, session)
-    else:
-        # Idle or unknown state - show menu
-        await message.reply_text("Choose an option:", reply_markup=main_menu())
-
-
-# ----------------- STATE HANDLERS -----------------
-
-async def handle_channel_forward(client: Client, message: Message, session: Dict[str, Any]):
-    """Handle channel forward/identification."""
-    user_id = message.from_user.id
-    fwd_chat = message.forward_from_chat
-
-    LOGGER.debug(
-        "Processing channel forward: user=%s, forward_from_chat=%s",
-        user_id,
-        fwd_chat.id if fwd_chat else None
-    )
-
-    # If no forward info, try to interpret message text as channel reference
-    if not fwd_chat:
-        text = (message.text or "").strip()
-        identifier = None
-
-        if text.startswith("@"):
-            identifier = text
-        elif "t.me/" in text:
-            try:
-                part = text.split("t.me/")[-1].split("?")[0].strip().strip("/")
-                if not part.startswith("joinchat/") and part:
-                    identifier = part
-            except Exception as e:
-                LOGGER.error("Error parsing t.me link: %s", e)
-                identifier = None
-        elif text.lstrip("-").isdigit():
-            try:
-                identifier = int(text)
-            except Exception as e:
-                LOGGER.error("Error parsing chat ID: %s", e)
-                identifier = None
-
-        if identifier:
-            try:
-                chat = await client.get_chat(identifier)
-                fwd_chat = chat
-                LOGGER.info("Resolved chat from identifier: %s -> %s", identifier, chat.id)
-            except PeerIdInvalid:
-                await message.reply_text(
-                    "⚠️ **Invalid channel identifier.**\n\n"
-                    "Please ensure:\n"
-                    "• The channel username is correct\n"
-                    "• The channel is public\n"
-                    "• You've provided a valid link",
-                    reply_markup=cancel_keyboard(),
-                )
-                return
-            except ChannelPrivate:
-                await message.reply_text(
-                    "⚠️ **This channel is private.**\n\n"
-                    "For private channels, please forward a message from the channel instead.",
-                    reply_markup=cancel_keyboard(),
-                )
-                return
-            except Exception as e:
-                LOGGER.error("Error resolving chat identifier %s: %s", identifier, e)
-                await message.reply_text(
-                    f"⚠️ **Error accessing channel:** {str(e)}\n\n"
-                    "Please try again or use a different method.",
-                    reply_markup=cancel_keyboard(),
-                )
-                return
-
-    if not fwd_chat:
-        await message.reply_text(
-            "⚠️ **Invalid input.**\n\n"
-            "Please provide one of the following:\n"
-            "• Forward any message from the channel\n"
-            "• Send the channel username (e.g., `@channelname`)\n"
-            "• Send a public channel link (e.g., `https://t.me/channelname`)",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    # Verify it's a channel
-    if fwd_chat.type != ChatType.CHANNEL:
-        await message.reply_text(
-            "⚠️ **This is not a channel.**\n\n"
-            "Please provide a channel where the bot is admin.",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    # Verify bot is admin
-    try:
-        bot_member = await client.get_chat_member(fwd_chat.id, "me")
-        if not bot_member.privileges or not bot_member.privileges.can_post_messages:
-            await message.reply_text(
-                f"⚠️ **Bot is not admin in {fwd_chat.title}**\n\n"
-                "Please make the bot an admin with 'Post Messages' permission.",
-                reply_markup=cancel_keyboard(),
-            )
-            return
-    except ChatAdminRequired:
-        await message.reply_text(
-            f"⚠️ **Bot is not admin in {fwd_chat.title}**\n\n"
-            "Please make the bot an admin with 'Post Messages' permission.",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-    except Exception as e:
-        LOGGER.error("Error checking admin status in %s: %s", fwd_chat.id, e)
-        await message.reply_text(
-            f"⚠️ **Error verifying bot permissions:** {str(e)}\n\n"
-            "Please ensure the bot is admin in the channel.",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    # Add channel
-    added = add_user_channel(user_id, fwd_chat.id, fwd_chat.title or str(fwd_chat.id))
-    session["state"] = "idle"
-
-    if added:
-        await message.reply_text(
-            f"✅ **Channel added successfully!**\n\n"
-            f"**Channel:** {fwd_chat.title}\n"
-            f"**ID:** `{fwd_chat.id}`\n\n"
-            "You can now create posts for this channel.",
-            reply_markup=main_menu(),
-        )
-    else:
-        await message.reply_text(
-            f"ℹ️ **Channel already exists!**\n\n"
-            f"**Channel:** {fwd_chat.title}\n"
-            f"**ID:** `{fwd_chat.id}`",
-            reply_markup=main_menu(),
-        )
-
-
-async def handle_post_content(_: Client, message: Message, session: Dict[str, Any]):
-    """Handle post content input."""
-    user_id = message.from_user.id
-
-    post: Dict[str, Any] = {
-        "type": None,
-        "text": None,
-        "file_id": None,
-        "caption": None,
-        "buttons": [],
-    }
-
-    if message.photo:
-        post["type"] = "photo"
-        post["file_id"] = message.photo.file_id
-        post["caption"] = message.caption or ""
-        LOGGER.info("User %s created photo post", user_id)
-    elif message.video:
-        post["type"] = "video"
-        post["file_id"] = message.video.file_id
-        post["caption"] = message.caption or ""
-        LOGGER.info("User %s created video post", user_id)
-    elif message.text:
-        post["type"] = "text"
-        post["text"] = message.text
-        LOGGER.info("User %s created text post", user_id)
-    else:
-        await message.reply_text(
-            "⚠️ **Unsupported content type.**\n\n"
-            "Please send:\n"
-            "• Text message\n"
-            "• Photo (with optional caption)\n"
-            "• Video (with optional caption)",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    session["post"] = post
-    session["state"] = "await_add_buttons"
-
-    await message.reply_text(
-        "✅ **Post content received!**\n\n"
-        "Would you like to add inline buttons (links) to this post?",
-        reply_markup=add_button_or_skip_keyboard(),
-    )
-
-
-async def handle_button_text(_: Client, message: Message, session: Dict[str, Any]):
-    """Handle button text input."""
-    text = message.text
-    if not text:
-        await message.reply_text(
-            "⚠️ Please send the **button text** as a message.\n\n"
-            "Example: `Visit Website`",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    if len(text) > 100:
-        await message.reply_text(
-            "⚠️ **Button text is too long** (max 100 characters).\n\n"
-            "Please send a shorter text.",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    session["tmp_button_text"] = text
-    session["state"] = "await_button_url"
+    button_rows = []
+    for i in range(0, len(buttons), 2):
+        if i + 1 < len(buttons):
+            # Two buttons side by side
+            button_rows.append([
+                InlineKeyboardButton(buttons[i][0], url=buttons[i][1]),
+                InlineKeyboardButton(buttons[i+1][0], url=buttons[i+1][1])
+            ])
+        else:
+            # Single button, full width
+            button_rows.append([InlineKeyboardButton(buttons[i][0], url=buttons[i][1])])
     
-    await message.reply_text(
-        f"✅ Button text: **{text}**\n\n"
-        "Now send the **URL** for this button.\n\n"
-        "Example: `https://example.com`",
-        reply_markup=cancel_keyboard(),
-    )
+    return InlineKeyboardMarkup(button_rows)
 
-
-async def handle_button_url(_: Client, message: Message, session: Dict[str, Any]):
-    """Handle button URL input."""
-    url = (message.text or "").strip()
-    
-    if not url:
-        await message.reply_text(
-            "⚠️ Please send a valid URL.",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-    
-    if not (url.startswith("http://") or url.startswith("https://")):
-        await message.reply_text(
-            "⚠️ **Invalid URL format.**\n\n"
-            "URL must start with `http://` or `https://`\n\n"
-            "Example: `https://example.com`",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    if not session.get("post"):
-        reset_session(message.from_user.id)
-        await message.reply_text(
-            "⚠️ **Session expired.**\n\n"
-            "Please start a new post.",
-            reply_markup=main_menu(),
-        )
-        return
-
-    btn_text = session.get("tmp_button_text") or "Button"
-    session["post"]["buttons"].append({"text": btn_text, "url": url})
-    session["tmp_button_text"] = None
-    session["state"] = "await_add_buttons"
-
-    buttons_count = len(session["post"]["buttons"])
-    
-    await message.reply_text(
-        f"✅ **Button added!**\n\n"
-        f"**Text:** {btn_text}\n"
-        f"**URL:** {url}\n\n"
-        f"**Total buttons:** {buttons_count}",
-        disable_web_page_preview=True,
-        reply_markup=done_more_buttons_keyboard(),
-    )
-
-
-# ----------------- CALLBACK QUERIES -----------------
-
-@app.on_callback_query()
-async def callbacks(client: Client, query: CallbackQuery):
-    """Handle all callback queries."""
-    user_id = query.from_user.id
-    data = query.data or ""
-    session = get_session(user_id)
-
-    LOGGER.debug("User %s pressed button: %s", user_id, data)
-
-    # Ignore dummy callbacks
-    if data == "noop":
-        await query.answer("No action available", show_alert=False)
-        return
-
-    # Menu: New Post
-    if data == "menu_new_post":
-        channels = get_user_channels(user_id)
-        if not channels:
-            await query.answer("Please add a channel first!", show_alert=True)
-            await client.send_message(
-                user_id,
-                "⚠️ **No channels available.**\n\n"
-                "Please add a channel first using the 'Add Channel' button.",
-                reply_markup=main_menu(),
-            )
-            return
-        
-        session["state"] = "await_post_content"
-        session["post"] = None
-        session["tmp_button_text"] = None
-        await query.answer()
-        await client.send_message(
-            user_id,
-            "📝 **Create New Post**\n\n"
-            "Send me the post content:\n\n"
-            "• **Text** - Just type your message\n"
-            "• **Photo** - Send a photo with optional caption\n"
-            "• **Video** - Send a video with optional caption",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    # Menu: Add Channel
-    if data == "menu_add_channel":
-        session["state"] = "await_channel_forward"
-        await query.answer()
-        await client.send_message(
-            user_id,
-            "📡 **Add a Channel**\n\n"
-            "To add a channel, you can:\n\n"
-            "**1.** Forward any message from the channel to me\n"
-            "**2.** Send the channel username (e.g., `@channelname`)\n"
-            "**3.** Send the channel link (e.g., `https://t.me/channelname`)\n\n"
-            "⚠️ **Important:** The bot must be an admin in the channel!",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    # Menu: Remove Channel
-    if data == "menu_remove_channel":
-        channels = get_user_channels(user_id)
-        if not channels:
-            await query.answer("No channels to remove!", show_alert=True)
-            return
-        
-        await query.answer()
-        await client.send_message(
-            user_id,
-            "🗑️ **Remove a Channel**\n\n"
-            "Select the channel you want to remove:",
-            reply_markup=channel_remove_keyboard(user_id),
-        )
-        return
-
-    # Menu: Cancel
-    if data == "menu_cancel":
-        reset_session(user_id)
-        await query.answer("Cancelled")
-        await client.send_message(
-            user_id,
-            "❌ **Action cancelled.**",
-            reply_markup=main_menu()
-        )
-        return
-
-    # Post: Add Button
-    if data == "post_add_button":
-        session["state"] = "await_button_text"
-        await query.answer()
-        await client.send_message(
-            user_id,
-            "➕ **Add Inline Button**\n\n"
-            "Send the **button text** (what users will see).\n\n"
-            "Example: `Visit Website` or `Join Channel`",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    # Post: Skip Buttons
-    if data == "post_skip_buttons":
-        session["state"] = "await_channel_select"
-        await query.answer()
-        await client.send_message(
-            user_id,
-            "📤 **Select Target Channel**\n\n"
-            "Where do you want to post this?",
-            reply_markup=channel_select_keyboard(user_id),
-        )
-        return
-
-    # Post: Done with Buttons
-    if data == "post_done_buttons":
-        session["state"] = "await_channel_select"
-        await query.answer()
-        
-        buttons_count = len(session.get("post", {}).get("buttons", []))
-        await client.send_message(
-            user_id,
-            f"✅ **Buttons configured!**\n\n"
-            f"Total buttons: {buttons_count}\n\n"
-            "📤 **Select Target Channel**\n\n"
-            "Where do you want to post this?",
-            reply_markup=channel_select_keyboard(user_id),
-        )
-        return
-
-    # Channel Selection or Remove
-    if data.startswith("target_channel:") or data == "target_all":
-        await query.answer()
-        await handle_post_target(client, query, session)
-        return
-
-    if data.startswith("remove_channel:"):
-        await query.answer()
-        await handle_channel_remove(client, query, session)
-        return
-
-    # Unknown callback
-    await query.answer("Unknown action", show_alert=False)
-
-
-async def handle_channel_remove(client: Client, query: CallbackQuery, session: Dict[str, Any]):
-    """Handle channel removal."""
-    user_id = query.from_user.id
-    
-    try:
-        ch_id = int(query.data.split(":", 1)[1])
-    except Exception as e:
-        LOGGER.error("Error parsing channel ID from callback: %s", e)
-        await client.send_message(
-            user_id,
-            "⚠️ **Error processing request.**",
-            reply_markup=main_menu(),
-        )
-        return
-    
-    # Find channel title before removing
-    channels = get_user_channels(user_id)
-    channel_title = next((c["title"] for c in channels if c["id"] == ch_id), "Unknown")
-    
-    removed = remove_user_channel(user_id, ch_id)
-    
-    if removed:
-        await client.send_message(
-            user_id,
-            f"✅ **Channel removed successfully!**\n\n"
-            f"**Channel:** {channel_title}\n"
-            f"**ID:** `{ch_id}`",
-            reply_markup=main_menu(),
-        )
-    else:
-        await client.send_message(
-            user_id,
-            "⚠️ **Channel not found.**",
-            reply_markup=main_menu(),
-        )
-
-
-async def handle_post_target(client: Client, query: CallbackQuery, session: Dict[str, Any]):
-    """Handle post distribution to selected channel(s)."""
-    user_id = query.from_user.id
-    data = query.data
-
-    post = session.get("post")
-    if not post:
-        reset_session(user_id)
-        await client.send_message(
-            user_id,
-            "⚠️ **Session expired.**\n\n"
-            "Please create the post again.",
-            reply_markup=main_menu(),
-        )
-        return
-
-    user_channels = get_user_channels(user_id)
-    if not user_channels:
-        reset_session(user_id)
-        await client.send_message(
-            user_id,
-            "⚠️ **No channels available.**\n\n"
-            "Please add a channel first.",
-            reply_markup=main_menu(),
-        )
-        return
-
-    # Determine target channel IDs
-    target_ids: List[int] = []
-    if data == "target_all":
-        target_ids = [c["id"] for c in user_channels]
-    else:
-        try:
-            ch_id = int(data.split(":", 1)[1])
-            target_ids = [ch_id]
-        except Exception as e:
-            LOGGER.error("Error parsing target channel ID: %s", e)
-            await client.send_message(
-                user_id,
-                "⚠️ **Invalid channel selection.**",
-                reply_markup=main_menu(),
-            )
-            return
-
-    markup = build_buttons_markup(post)
-    
-    sent_to = 0
-    failed = 0
-    error_details = []
-
-    # Send to each target channel
-    for cid in target_ids:
-        channel_title = next((c["title"] for c in user_channels if c["id"] == cid), str(cid))
-        
-        try:
-            if post["type"] == "text":
-                await client.send_message(cid, post["text"], reply_markup=markup)
-            elif post["type"] == "photo":
-                await client.send_photo(
-                    cid,
-                    post["file_id"],
-                    caption=post.get("caption") or "",
-                    reply_markup=markup,
-                )
-            elif post["type"] == "video":
-                await client.send_video(
-                    cid,
-                    post["file_id"],
-                    caption=post.get("caption") or "",
-                    reply_markup=markup,
-                )
-            
-            sent_to += 1
-            LOGGER.info("Successfully posted to channel %s (%s)", channel_title, cid)
-            
-        except ChatAdminRequired:
-            failed += 1
-            error_details.append(f"❌ {channel_title}: Bot is not admin")
-            LOGGER.error("Bot is not admin in channel %s (%s)", channel_title, cid)
-        except ChannelPrivate:
-            failed += 1
-            error_details.append(f"❌ {channel_title}: Channel is private")
-            LOGGER.error("Channel %s (%s) is private or bot was removed", channel_title, cid)
-        except FloodWait as e:
-            failed += 1
-            error_details.append(f"❌ {channel_title}: Rate limited ({e.value}s)")
-            LOGGER.error("FloodWait error for channel %s: %s seconds", cid, e.value)
-        except UserIsBlocked:
-            failed += 1
-            error_details.append(f"❌ {channel_title}: Bot is blocked")
-            LOGGER.error("Bot is blocked by channel %s", cid)
-        except Exception as e:
-            failed += 1
-            error_details.append(f"❌ {channel_title}: {str(e)[:50]}")
-            LOGGER.error("Error sending to channel %s (%s): %s", channel_title, cid, e)
-
-    reset_session(user_id)
-
-    # Build result message
-    result_msg = "📊 **Posting Complete!**\n\n"
-    result_msg += f"✅ **Sent:** {sent_to}\n"
-    result_msg += f"❌ **Failed:** {failed}\n"
-    
-    if error_details:
-        result_msg += "\n**Error Details:**\n"
-        result_msg += "\n".join(error_details[:5])  # Limit to first 5 errors
-        if len(error_details) > 5:
-            result_msg += f"\n...and {len(error_details) - 5} more"
-
-    await client.send_message(
-        user_id,
-        result_msg,
-        reply_markup=main_menu(),
-    )
-
-
-# ----------------- ERROR HANDLER -----------------
-
-@app.on_message(filters.private)
-async def error_handler(_: Client, message: Message):
-    """Catch-all error handler for unexpected messages."""
-    # This handler has lowest priority and catches anything not handled above
-    pass
-
-
-# ----------------- GRACEFUL SHUTDOWN HANDLER -----------------
-
-# Global flag for shutdown
-is_shutting_down = False
-
-def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully."""
-    global is_shutting_down
-    signal_name = signal.Signals(signum).name
-    LOGGER.warning(f"⚠️ Received {signal_name} signal. Initiating graceful shutdown...")
-    is_shutting_down = True
-
-
-# Register signal handlers
-signal.signal(signal.SIGTERM, signal_handler)  # Render sends this
-signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-
-
-# ----------------- HEALTH CHECK SERVER FOR RENDER -----------------
+# --------------------------------------------------------------------------
+# WEB SERVER (KEEP-ALIVE)
+# --------------------------------------------------------------------------
 
 async def health_check(request):
-    """Health check endpoint for uptime monitoring."""
-    if is_shutting_down:
-        return web.Response(text="Shutting down...", status=503)
-    
-    # Check if bot is actually connected
-    try:
-        if app.is_connected:
-            return web.Response(text="Bot is running!", status=200)
-        else:
-            return web.Response(text="Bot disconnected", status=503)
-    except Exception as e:
-        LOGGER.error("Health check error: %s", e)
-        return web.Response(text=f"Error: {str(e)}", status=500)
+    """Simple route to keep Render happy."""
+    return web.Response(text="Bot is Running OK")
 
-
-async def run_health_server():
-    """Run aiohttp web server for health checks (Render requirement)."""
-    app_web = web.Application()
-    app_web.router.add_get('/', health_check)
-    app_web.router.add_get('/health', health_check)
-    
-    runner = web.AppRunner(app_web)
+async def start_web_server():
+    """Starts the aiohttp web server."""
+    server = web.Application()
+    server.router.add_get("/", health_check)
+    runner = web.AppRunner(server)
     await runner.setup()
-    
-    # Render provides PORT env variable
-    port = int(os.getenv('PORT', 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    # Bind to 0.0.0.0 so outside world can access (required by Render)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    
-    LOGGER.info("✅ Health check server started on 0.0.0.0:%d", port)
-    LOGGER.info("✅ Health endpoints: / and /health")
-    
-    # Keep the server running, check for shutdown signal
-    try:
-        while not is_shutting_down:
-            await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        LOGGER.info("🛑 Shutting down health check server...")
-        await runner.cleanup()
+    logger.info(f"Web server running on port {PORT}")
 
+### Removed duplicated early admin handlers block to avoid double registration
 
-# ----------------- MAIN -----------------
+# --------------------------------------------------------------------------
+# ADMIN HANDLERS
+# --------------------------------------------------------------------------
 
-async def start_bot():
-    """Start the bot and health check server."""
-    global is_shutting_down
+# 1. START COMMAND (ADMIN VIEW)
+@app.on_message(filters.command("start") & filters.user(ADMIN_USER_ID) & filters.private)
+async def admin_start(client, message):
+    # Check if there is a deep link payload (e.g. /start code_123) even for admin
+    command_parts = message.command
+    if command_parts and len(command_parts) > 1:
+        await user_start_handler(client, message)
+        return
+
+    # Admin Main Menu
+    buttons = [
+        [InlineKeyboardButton("📝 New Post", callback_data="admin_new_post")],
+        [InlineKeyboardButton("📋 Manage Must Join Channels", callback_data="admin_manage_join_channels")],
+        [InlineKeyboardButton("📢 Manage Post Channels", callback_data="admin_manage_post_channels")],
+        [InlineKeyboardButton("📜 View All Channels", callback_data="admin_view_all_channels")]
+    ]
+
+    intro = (
+        "**👮‍♂️ Admin Panel**\n\n"
+        "Welcome to your FileShare Bot control center.\n"
+        "You can create broadcast posts, add or remove forced-subscription channels, and view the list of channels.\n\n"
+        "Use the buttons below to proceed. Sending any message will re-show this panel if you're not in a wizard." 
+    )
+
+    await message.reply_text(intro, reply_markup=InlineKeyboardMarkup(buttons))
+
+# 2. MANAGE MUST JOIN CHANNELS
+@app.on_callback_query(filters.regex("admin_manage_join_channels") & filters.user(ADMIN_USER_ID))
+async def manage_join_channels_menu(client, callback_query):
+    buttons = [
+        [InlineKeyboardButton("➕ Add Join Channel", callback_data="add_join_channel")],
+        [InlineKeyboardButton("➖ Remove Join Channel", callback_data="remove_join_channel")],
+        [InlineKeyboardButton("📜 View Join Channels", callback_data="view_join_channels")],
+        [get_back_button("admin_back_main")]
+    ]
     
-    try:
-        load_channels()
+    await callback_query.message.edit_text(
+        "**📋 Manage Must Join Channels**\n\n"
+        "These channels users MUST join before downloading files.\n"
+        "Choose an option below:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# 3. MANAGE POST CHANNELS  
+@app.on_callback_query(filters.regex("admin_manage_post_channels") & filters.user(ADMIN_USER_ID))
+async def manage_post_channels_menu(client, callback_query):
+    buttons = [
+        [InlineKeyboardButton("➕ Add Post Channel", callback_data="add_post_channel")],
+        [InlineKeyboardButton("➖ Remove Post Channel", callback_data="remove_post_channel")],
+        [InlineKeyboardButton("📜 View Post Channels", callback_data="view_post_channels")],
+        [get_back_button("admin_back_main")]
+    ]
+    
+    await callback_query.message.edit_text(
+        "**📢 Manage Post Channels**\n\n"
+        "These channels are where the bot will post your content.\n"
+        "Choose an option below:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# ADD JOIN CHANNEL
+@app.on_callback_query(filters.regex("add_join_channel") & filters.user(ADMIN_USER_ID))
+async def add_join_channel(client, callback_query):
+    user_states[callback_query.from_user.id] = "WAITING_JOIN_CHANNEL_INPUT"
+    
+    buttons = [[InlineKeyboardButton("❌ Cancel", callback_data="admin_manage_join_channels")]]
+    
+    await callback_query.message.edit_text(
+        "**➕ Add Must Join Channel**\n\n"
+        "Please **Forward a message** from the channel to here, or send the **@username**.\n\n"
+        "⚠️ *Note: Users will be required to join this channel before downloading files!*",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# ADD POST CHANNEL
+@app.on_callback_query(filters.regex("add_post_channel") & filters.user(ADMIN_USER_ID))
+async def add_post_channel(client, callback_query):
+    user_states[callback_query.from_user.id] = "WAITING_POST_CHANNEL_INPUT"
+    
+    buttons = [[InlineKeyboardButton("❌ Cancel", callback_data="admin_manage_post_channels")]]
+    
+    await callback_query.message.edit_text(
+        "**➕ Add Post Channel**\n\n"
+        "Please **Forward a message** from the channel to here, or send the **@username**.\n\n"
+        "⚠️ *Note: Make sure I am an Admin in that channel first!*",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@app.on_message(filters.user(ADMIN_USER_ID) & filters.private)
+async def handle_admin_inputs(client, message):
+    state = user_states.get(message.from_user.id)
+
+    # If no active wizard state, show intro panel (requirement #1)
+    if not state:
+        # Ensure stale state cleared
+        user_states.pop(message.from_user.id, None)
+        await admin_start(client, message)
+        return
+
+    # --- HANDLE ADD JOIN CHANNEL INPUT ---
+    if state == "WAITING_JOIN_CHANNEL_INPUT":
+        chat_id = None
+        chat_title = None
+        chat_username = None
+
+        # Try to get chat details from Forward
+        if message.forward_from_chat:
+            chat_id = message.forward_from_chat.id
+            chat_title = message.forward_from_chat.title
+            chat_username = message.forward_from_chat.username
+        # Try to get chat details from Text (@username)
+        elif message.text:
+            try:
+                chat = await client.get_chat(message.text)
+                chat_id = chat.id
+                chat_title = chat.title
+                chat_username = chat.username
+            except Exception:
+                await message.reply("❌ Could not find that channel. Ensure the username is correct.")
+                return
+
+        if chat_id:
+            # Save to Must Join Channels DB
+            try:
+                existing = await must_join_channels_col.find_one({"channel_id": chat_id})
+                if existing:
+                    await message.reply("ℹ️ This channel is already in the must join list.")
+                else:
+                    await must_join_channels_col.insert_one({
+                        "channel_id": chat_id,
+                        "title": chat_title,
+                        "username": chat_username,
+                        "added_at": datetime.utcnow()
+                    })
+                    await message.reply(f"✅ **Successfully Added to Must Join List:** {chat_title}")
+            except Exception as e:
+                logger.error(f"DB Error adding join channel: {e}")
+                await message.reply("❌ Database error occurred.")
         
-        LOGGER.info("=" * 50)
-        LOGGER.info("🚀 Bot starting...")
-        LOGGER.info("API_ID: %s", API_ID)
-        LOGGER.info("Channels loaded: %d users", len(channels_data))
-        LOGGER.info("=" * 50)
+        # Reset State and go back to join channels menu
+        user_states.pop(message.from_user.id, None)
+        # Send a new message with the join channels menu
+        buttons = [
+            [InlineKeyboardButton("➕ Add Join Channel", callback_data="add_join_channel")],
+            [InlineKeyboardButton("➖ Remove Join Channel", callback_data="remove_join_channel")],
+            [InlineKeyboardButton("📜 View Join Channels", callback_data="view_join_channels")],
+            [get_back_button("admin_back_main")]
+        ]
+        await message.reply(
+            "**📋 Manage Must Join Channels**\n\n"
+            "These channels users MUST join before downloading files.\n"
+            "Choose an option below:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # --- HANDLE ADD POST CHANNEL INPUT ---
+    if state == "WAITING_POST_CHANNEL_INPUT":
+        chat_id = None
+        chat_title = None
+        chat_username = None
+
+        # Try to get chat details from Forward
+        if message.forward_from_chat:
+            chat_id = message.forward_from_chat.id
+            chat_title = message.forward_from_chat.title
+            chat_username = message.forward_from_chat.username
+        # Try to get chat details from Text (@username)
+        elif message.text:
+            try:
+                chat = await client.get_chat(message.text)
+                chat_id = chat.id
+                chat_title = chat.title
+                chat_username = chat.username
+            except Exception:
+                await message.reply("❌ Could not find that channel. Ensure I am admin there or check the username.")
+                return
+
+        if chat_id:
+            # Verify Admin Status for post channels
+            try:
+                member = await client.get_chat_member(chat_id, "me")
+                if member.status != enums.ChatMemberStatus.ADMINISTRATOR:
+                    await message.reply("⚠️ I am not an Admin in that channel. Please promote me and try again.")
+                    return
+            except Exception as e:
+                await message.reply(f"❌ Error accessing channel: {e}")
+                return
+
+            # Save to Post Channels DB
+            try:
+                existing = await post_channels_col.find_one({"channel_id": chat_id})
+                if existing:
+                    await message.reply("ℹ️ This channel is already in the post channels list.")
+                else:
+                    await post_channels_col.insert_one({
+                        "channel_id": chat_id,
+                        "title": chat_title,
+                        "username": chat_username,
+                        "added_at": datetime.utcnow()
+                    })
+                    await message.reply(f"✅ **Successfully Added to Post Channels:** {chat_title}")
+            except Exception as e:
+                logger.error(f"DB Error adding post channel: {e}")
+                await message.reply("❌ Database error occurred.")
         
-        # Start health server FIRST (so Render sees port immediately)
-        health_task = asyncio.create_task(run_health_server())
+        # Reset State and go back to post channels menu
+        user_states.pop(message.from_user.id, None)
+        # Send a new message with the post channels menu
+        buttons = [
+            [InlineKeyboardButton("➕ Add Post Channel", callback_data="add_post_channel")],
+            [InlineKeyboardButton("➖ Remove Post Channel", callback_data="remove_post_channel")],
+            [InlineKeyboardButton("📜 View Post Channels", callback_data="view_post_channels")],
+            [get_back_button("admin_back_main")]
+        ]
+        await message.reply(
+            "**📢 Manage Post Channels**\n\n"
+            "These channels are where the bot will post your content.\n"
+            "Choose an option below:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # --- HANDLE TEXT EDITING ---
+    if state == "WAITING_TEXT_EDIT":
+        if not message.text and not message.caption:
+            await message.reply("❌ Please send text content.")
+            return
+            
+        # Update text and entities in cache
+        new_text = message.text or message.caption or ""
+        new_entities = message.entities or message.caption_entities or []
         
-        # Wait a bit for health server to bind
-        await asyncio.sleep(2)
-        LOGGER.info("✅ Health server confirmed running")
+        if message.from_user.id in post_cache:
+            post_cache[message.from_user.id]['text'] = new_text
+            post_cache[message.from_user.id]['entities'] = new_entities
+            await message.reply("✅ **Text Updated Successfully!**")
+        else:
+            await message.reply("❌ Session expired. Please start creating a new post.")
+            
+        user_states[message.from_user.id] = "BUILDING_POST"
+        await show_post_builder_menu(client, message.chat.id)
+        return
+
+    # --- HANDLE NEW POST WIZARD: CONTENT ---
+    if state == "WAITING_POST_CONTENT":
+        # Store basic content info with entities for styled text
+        cache = {
+            "type": "text",
+            "text": message.text or message.caption or "",
+            "entities": message.entities or message.caption_entities or [],
+            "file_id": None,
+            "buttons": [], # List of [text, url]
+            "attached_file_token": None
+        }
+
+        if message.photo:
+            cache["type"] = "photo"
+            cache["file_id"] = message.photo.file_id
+        elif message.video:
+            cache["type"] = "video"
+            cache["file_id"] = message.video.file_id
+        elif message.document: # Fallback if they send document as content
+            cache["type"] = "document"
+            cache["file_id"] = message.document.file_id
+        elif message.audio:
+            cache["type"] = "audio"
+            cache["file_id"] = message.audio.file_id
+
+        post_cache[message.from_user.id] = cache
+        user_states[message.from_user.id] = "BUILDING_POST"
         
-        # Now start the Pyrogram client
-        LOGGER.info("🔌 Starting Pyrogram client...")
-        await app.start()
-        LOGGER.info("✅ Pyrogram client connected!")
+        # Show the Builder Menu
+        await show_post_builder_menu(client, message.chat.id)
+        return
+
+    # --- HANDLE NEW POST WIZARD: URL BUTTONS ---
+    if state == "WAITING_URL_BUTTONS":
+        lines = message.text.split('\n')
+        buttons_added = 0
+        for line in lines:
+            if '-' in line:
+                parts = line.split('-', 1)
+                text = parts[0].strip()
+                url = parts[1].strip()
+                post_cache[message.from_user.id]['buttons'].append([text, url])
+                buttons_added += 1
         
-        LOGGER.info("🎉 Bot is fully operational!")
+        user_states[message.from_user.id] = "BUILDING_POST"
+        await message.reply(f"✅ Added {buttons_added} buttons.")
+        await show_post_builder_menu(client, message.chat.id)
+        return
+
+    # --- HANDLE NEW POST WIZARD: FILE ATTACHMENT ---
+    if state == "WAITING_FILE_ATTACH":
+        if not message.media:
+            await message.reply("❌ Please send a file (Photo, Video, or Document).")
+            return
+
+        # Get File ID and info
+        file_id = None
+        file_name = "File"
+        file_type = "document"
         
-        # Wait for shutdown signal
-        while not is_shutting_down:
-            await asyncio.sleep(1)
+        # Determine type and ID
+        if message.document:
+            file_id = message.document.file_id
+            file_name = message.document.file_name or "Document"
+            file_type = "document"
+        elif message.video:
+            file_id = message.video.file_id
+            file_name = "Video"
+            file_type = "video"
+        elif message.photo:
+            file_id = message.photo.file_id
+            file_name = "Photo"
+            file_type = "photo"
+        elif message.audio:
+            file_id = message.audio.file_id
+            file_name = "Audio"
+            file_type = "audio"
+
+        # Store file info temporarily and ask for button title
+        post_cache[message.from_user.id]['temp_file'] = {
+            "file_id": file_id,
+            "file_type": file_type,
+            "file_name": file_name,
+            "caption": message.caption or ""
+        }
         
-        # Graceful shutdown
-        LOGGER.info("🛑 Initiating graceful shutdown...")
+        user_states[message.from_user.id] = "WAITING_BUTTON_TITLE"
+        buttons = [
+            [InlineKeyboardButton("🔙 Back", callback_data="wiz_back_attach_file")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="wiz_cancel")]
+        ]
         
-        # Cancel health server
-        health_task.cancel()
+        await message.reply(
+            f"📎 **File Received: {file_name}**\n\n"
+            "Now please send the **button title** you want users to see.\n"
+            "For example: `📥 Download Movie` or `🎵 Get Audio`",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # --- HANDLE BUTTON TITLE INPUT ---
+    if state == "WAITING_BUTTON_TITLE":
+        if not message.text:
+            await message.reply("❌ Please send text for the button title.")
+            return
+            
+        button_title = message.text.strip()
+        temp_file = post_cache[message.from_user.id].get('temp_file')
+        
+        if not temp_file:
+            await message.reply("❌ Session expired. Please attach the file again.")
+            user_states[message.from_user.id] = "BUILDING_POST"
+            await show_post_builder_menu(client, message.chat.id)
+            return
+
+        # Generate Token and Save to DB
         try:
-            await health_task
-        except asyncio.CancelledError:
-            pass
+            token = generate_random_token()
+            bot_username = (await client.get_me()).username
+            
+            await fileshares_col.insert_one({
+                "token": token,
+                "file_id": temp_file["file_id"],
+                "file_type": temp_file["file_type"],
+                "file_name": temp_file["file_name"],
+                "caption": temp_file["caption"],
+                "button_title": button_title,
+                "created_at": datetime.utcnow()
+            })
+
+            # Add custom button to the post
+            deep_link = f"https://t.me/{bot_username}?start={token}"
+            post_cache[message.from_user.id]['buttons'].append([button_title, deep_link])
+            post_cache[message.from_user.id]['attached_file_token'] = token
+            
+            # Clear temp file data
+            post_cache[message.from_user.id].pop('temp_file', None)
+
+            user_states[message.from_user.id] = "BUILDING_POST"
+            await message.reply(f"✅ File Attached with Button: **{button_title}**")
+            await show_post_builder_menu(client, message.chat.id)
+        except Exception as e:
+            logger.error(f"Error saving file share: {e}")
+            await message.reply("❌ Error saving file info to database.")
+        return
+
+# REMOVE JOIN CHANNEL HANDLER
+@app.on_callback_query(filters.regex("remove_join_channel") & filters.user(ADMIN_USER_ID))
+async def remove_join_channel_list(client, callback_query):
+    try:
+        channels = must_join_channels_col.find({})
+        buttons = []
+        async for ch in channels:
+            btn_text = f"{ch.get('title', 'Unknown')} (ID: {ch['channel_id']})"
+            buttons.append([InlineKeyboardButton(btn_text, callback_data=f"rm_join_ch_{ch['channel_id']}")])
         
-        # Stop Pyrogram client
-        LOGGER.info("🛑 Stopping Pyrogram client...")
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_manage_join_channels")])
+        
+        if not buttons:
+            await callback_query.answer("No join channels found!", show_alert=True)
+            return
+
+        await callback_query.message.edit_text(
+            "🗑 **Tap a Must Join channel to remove it:**",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception as e:
+        logger.error(f"Error listing join channels: {e}")
+        await callback_query.answer("Error loading channels.", show_alert=True)
+
+@app.on_callback_query(filters.regex(r"^rm_join_ch_") & filters.user(ADMIN_USER_ID))
+async def confirm_remove_join_channel(client, callback_query):
+    try:
+        channel_id = int(callback_query.data.split("_")[3])
+        await must_join_channels_col.delete_one({"channel_id": channel_id})
+        await callback_query.answer("✅ Join Channel Removed", show_alert=True)
+        # Refresh list
+        await remove_join_channel_list(client, callback_query)
+    except Exception as e:
+        logger.error(e)
+        await callback_query.answer("Error removing channel.", show_alert=True)
+
+# REMOVE POST CHANNEL HANDLER
+@app.on_callback_query(filters.regex("remove_post_channel") & filters.user(ADMIN_USER_ID))
+async def remove_post_channel_list(client, callback_query):
+    try:
+        channels = post_channels_col.find({})
+        buttons = []
+        async for ch in channels:
+            btn_text = f"{ch.get('title', 'Unknown')} (ID: {ch['channel_id']})"
+            buttons.append([InlineKeyboardButton(btn_text, callback_data=f"rm_post_ch_{ch['channel_id']}")])
+        
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_manage_post_channels")])
+        
+        if not buttons:
+            await callback_query.answer("No post channels found!", show_alert=True)
+            return
+
+        await callback_query.message.edit_text(
+            "🗑 **Tap a Post channel to remove it:**",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception as e:
+        logger.error(f"Error listing post channels: {e}")
+        await callback_query.answer("Error loading channels.", show_alert=True)
+
+@app.on_callback_query(filters.regex(r"^rm_post_ch_") & filters.user(ADMIN_USER_ID))
+async def confirm_remove_post_channel(client, callback_query):
+    try:
+        channel_id = int(callback_query.data.split("_")[3])
+        await post_channels_col.delete_one({"channel_id": channel_id})
+        await callback_query.answer("✅ Post Channel Removed", show_alert=True)
+        # Refresh list
+        await remove_post_channel_list(client, callback_query)
+    except Exception as e:
+        logger.error(e)
+        await callback_query.answer("Error removing channel.", show_alert=True)
+
+@app.on_callback_query(filters.regex("admin_back_main") & filters.user(ADMIN_USER_ID))
+async def back_to_main(client, callback_query):
+    # Just call the start command logic visually
+    buttons = [
+        [InlineKeyboardButton("📝 New Post", callback_data="admin_new_post")],
+        [InlineKeyboardButton("📋 Manage Must Join Channels", callback_data="admin_manage_join_channels")],
+        [InlineKeyboardButton("📢 Manage Post Channels", callback_data="admin_manage_post_channels")],
+        [InlineKeyboardButton("📜 View All Channels", callback_data="admin_view_all_channels")]
+    ]
+    await callback_query.message.edit_text(
+        "**👮‍♂️ Admin Panel**\nSend any message to return here.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# VIEW JOIN CHANNELS
+@app.on_callback_query(filters.regex("view_join_channels") & filters.user(ADMIN_USER_ID))
+async def view_join_channels(client, callback_query):
+    try:
+        channels_cursor = must_join_channels_col.find({})
+        buttons = []
+        async for ch in channels_cursor:
+            title = ch.get('title', 'Channel')
+            username = ch.get('username')
+            if username:
+                buttons.append([InlineKeyboardButton(title, url=f"https://t.me/{username}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"{title} (No public link)", callback_data="noop")])
+
+        if not buttons:
+            buttons.append([InlineKeyboardButton("No must join channels added yet", callback_data="noop")])
+
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_manage_join_channels")])
+        await callback_query.message.edit_text(
+            "**📋 Must Join Channels List**\nUsers must join these to download files:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception as e:
+        logger.error(f"Error showing join channels list: {e}")
+        await callback_query.answer("Error loading list", show_alert=True)
+
+# VIEW POST CHANNELS
+@app.on_callback_query(filters.regex("view_post_channels") & filters.user(ADMIN_USER_ID))
+async def view_post_channels(client, callback_query):
+    try:
+        channels_cursor = post_channels_col.find({})
+        buttons = []
+        async for ch in channels_cursor:
+            title = ch.get('title', 'Channel')
+            username = ch.get('username')
+            if username:
+                buttons.append([InlineKeyboardButton(title, url=f"https://t.me/{username}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"{title} (No public link)", callback_data="noop")])
+
+        if not buttons:
+            buttons.append([InlineKeyboardButton("No post channels added yet", callback_data="noop")])
+
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_manage_post_channels")])
+        await callback_query.message.edit_text(
+            "**📢 Post Channels List**\nBot will post content to these channels:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception as e:
+        logger.error(f"Error showing post channels list: {e}")
+        await callback_query.answer("Error loading list", show_alert=True)
+
+# VIEW ALL CHANNELS
+@app.on_callback_query(filters.regex("admin_view_all_channels") & filters.user(ADMIN_USER_ID))
+async def admin_view_all_channels(client, callback_query):
+    try:
+        # Get both types of channels
+        join_channels = []
+        post_channels = []
+        
+        async for ch in must_join_channels_col.find({}):
+            join_channels.append(ch)
+            
+        async for ch in post_channels_col.find({}):
+            post_channels.append(ch)
+
+        buttons = []
+        
+        if join_channels:
+            buttons.append([InlineKeyboardButton("📋 Must Join Channels:", callback_data="noop")])
+            for ch in join_channels:
+                title = ch.get('title', 'Channel')
+                username = ch.get('username')
+                if username:
+                    buttons.append([InlineKeyboardButton(f"  └ {title}", url=f"https://t.me/{username}")])
+                else:
+                    buttons.append([InlineKeyboardButton(f"  └ {title} (private)", callback_data="noop")])
+        
+        if post_channels:
+            if join_channels:  # Add separator if we have join channels too
+                buttons.append([InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━", callback_data="noop")])
+            buttons.append([InlineKeyboardButton("📢 Post Channels:", callback_data="noop")])
+            for ch in post_channels:
+                title = ch.get('title', 'Channel')
+                username = ch.get('username')
+                if username:
+                    buttons.append([InlineKeyboardButton(f"  └ {title}", url=f"https://t.me/{username}")])
+                else:
+                    buttons.append([InlineKeyboardButton(f"  └ {title} (private)", callback_data="noop")])
+
+        if not join_channels and not post_channels:
+            buttons.append([InlineKeyboardButton("No channels added yet", callback_data="noop")])
+
+        buttons.append([get_back_button("admin_back_main")])
+        await callback_query.message.edit_text(
+            "**📜 All Channels Overview**\nTap a channel to open (if public):",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception as e:
+        logger.error(f"Error showing all channels list: {e}")
+        await callback_query.answer("Error loading list", show_alert=True)
+
+@app.on_callback_query(filters.regex("^noop$") & filters.user(ADMIN_USER_ID))
+async def noop_handler(client, callback_query):
+    await callback_query.answer("No public link available.", show_alert=True)
+
+
+
+# GENERIC CANCEL HANDLER
+@app.on_callback_query(filters.regex("admin_cancel_action") & filters.user(ADMIN_USER_ID))
+async def admin_cancel_action(client, callback_query):
+    user_states.pop(callback_query.from_user.id, None)
+    await callback_query.answer("Action Cancelled")
+    await back_to_main(client, callback_query)
+
+# --------------------------------------------------------------------------
+# NEW POST WIZARD (STATE MACHINE)
+# --------------------------------------------------------------------------
+
+@app.on_callback_query(filters.regex("admin_new_post") & filters.user(ADMIN_USER_ID))
+async def start_new_post(client, callback_query):
+    user_states[callback_query.from_user.id] = "WAITING_POST_CONTENT"
+    # Clear old cache
+    post_cache.pop(callback_query.from_user.id, None)
+    
+    buttons = [[get_cancel_button()]]
+
+    await callback_query.message.edit_text(
+        "**📝 Create New Post**\n\n"
+        "Send me the content now:\n"
+        "- Text Message\n"
+        "- Photo (with caption)\n"
+        "- Video (with caption)",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def show_post_builder_menu(client, chat_id):
+    buttons = [
+        [InlineKeyboardButton("✏️ Edit Text", callback_data="wiz_edit_text")],
+        [InlineKeyboardButton("➕ Add URL Buttons", callback_data="wiz_add_btn"),
+         InlineKeyboardButton("🗑️ Delete Buttons", callback_data="wiz_delete_buttons")],
+        [InlineKeyboardButton("📎 Attach FileShare File", callback_data="wiz_attach_file")],
+        [InlineKeyboardButton("▶️ Continue", callback_data="wiz_preview")],
+        [get_cancel_button("wiz_cancel")]
+    ]
+    await client.send_message(
+        chat_id,
+        "**⚙️ Post Builder Menu**\n\nWhat would you like to add next?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@app.on_callback_query(filters.regex("wiz_add_btn") & filters.user(ADMIN_USER_ID))
+async def wiz_add_btn(client, callback_query):
+    user_states[callback_query.from_user.id] = "WAITING_URL_BUTTONS"
+    buttons = [
+        [InlineKeyboardButton("🔙 Back", callback_data="wiz_back_to_builder")],
+        [get_cancel_button("wiz_cancel")]
+    ]
+    await callback_query.message.edit_text(
+        "**Add URL Buttons**\n\n"
+        "Send buttons in this format (one per line):\n"
+        "`Button Text - https://link.com`\n"
+        "`Join Us - https://t.me/example`",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@app.on_callback_query(filters.regex("wiz_attach_file") & filters.user(ADMIN_USER_ID))
+async def wiz_attach_file(client, callback_query):
+    user_states[callback_query.from_user.id] = "WAITING_FILE_ATTACH"
+    buttons = [
+        [InlineKeyboardButton("🔙 Back", callback_data="wiz_back_to_builder")],
+        [get_cancel_button("wiz_cancel")]
+    ]
+    await callback_query.message.edit_text(
+        "**📎 Attach File for FileShare**\n\n"
+        "Forward or upload the file you want users to download.\n"
+        "I will auto-generate a secured link and add a 'Download' button to this post.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@app.on_callback_query(filters.regex("wiz_preview") & filters.user(ADMIN_USER_ID))
+async def wiz_preview(client, callback_query):
+    user_id = callback_query.from_user.id
+    data = post_cache.get(user_id)
+    
+    if not data:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+
+    # Build Markup from buttons with proper formatting
+    markup = format_button_markup(data['buttons'])
+    
+    # Send Preview Header
+    await callback_query.message.edit_text("⬇️ **PREVIEW BELOW** ⬇️")
+    
+    try:
+        # Send preview with entities (styled text) preserved
+        if data['type'] == "text":
+            await client.send_message(
+                user_id, 
+                data['text'], 
+                entities=data.get('entities', []),
+                reply_markup=markup
+            )
+        elif data['type'] == "photo":
+            await client.send_photo(
+                user_id, 
+                data['file_id'], 
+                caption=data['text'],
+                caption_entities=data.get('entities', []),
+                reply_markup=markup
+            )
+        elif data['type'] == "video":
+            await client.send_video(
+                user_id, 
+                data['file_id'], 
+                caption=data['text'],
+                caption_entities=data.get('entities', []),
+                reply_markup=markup
+            )
+        elif data['type'] == "document":
+            await client.send_document(
+                user_id, 
+                data['file_id'], 
+                caption=data['text'],
+                caption_entities=data.get('entities', []),
+                reply_markup=markup
+            )
+        elif data['type'] == "audio":
+            await client.send_audio(
+                user_id, 
+                data['file_id'], 
+                caption=data['text'],
+                caption_entities=data.get('entities', []),
+                reply_markup=markup
+            )
+    except Exception as e:
+        await client.send_message(user_id, f"❌ Error generating preview: {e}")
+        return
+
+    # Send Controls - Send and Back on top row, Cancel below
+    control_buttons = [
+        [InlineKeyboardButton("📤 Send", callback_data="wiz_send_menu"),
+         InlineKeyboardButton("🔙 Back", callback_data="wiz_back_to_builder")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="wiz_cancel")]
+    ]
+    await client.send_message(
+        user_id, 
+        "**Is this preview correct?**", 
+        reply_markup=InlineKeyboardMarkup(control_buttons)
+    )
+
+@app.on_callback_query(filters.regex("wiz_edit_text") & filters.user(ADMIN_USER_ID))
+async def wiz_edit_text(client, callback_query):
+    user_states[callback_query.from_user.id] = "WAITING_TEXT_EDIT"
+    data = post_cache.get(callback_query.from_user.id, {})
+    current_text = data.get('text', '')
+    
+    buttons = [
+        [InlineKeyboardButton("🔙 Back", callback_data="wiz_back_to_builder")],
+        [get_cancel_button("wiz_cancel")]
+    ]
+    
+    message_text = "**✏️ Edit Text**\n\nSend new text to replace current content.\n\n"
+    if current_text:
+        message_text += f"**Current Text:**\n{current_text[:200]}{'...' if len(current_text) > 200 else ''}"
+    else:
+        message_text += "**No text content yet.** Send text to add content."
+    
+    await callback_query.message.edit_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@app.on_callback_query(filters.regex("wiz_delete_buttons") & filters.user(ADMIN_USER_ID))
+async def wiz_delete_buttons(client, callback_query):
+    data = post_cache.get(callback_query.from_user.id, {})
+    buttons_list = data.get('buttons', [])
+    
+    if not buttons_list:
+        await callback_query.answer("No buttons to delete!", show_alert=True)
+        return
+    
+    # Create buttons for deletion
+    delete_buttons = []
+    for i, btn in enumerate(buttons_list):
+        delete_buttons.append([InlineKeyboardButton(f"🗑️ {btn[0]}", callback_data=f"del_btn_{i}")])
+    
+    delete_buttons.append([InlineKeyboardButton("✅ Done", callback_data="wiz_back_to_builder")])
+    delete_buttons.append([get_cancel_button("wiz_cancel")])
+    
+    await callback_query.message.edit_text(
+        "**🗑️ Delete Buttons**\n\nTap a button to delete it:",
+        reply_markup=InlineKeyboardMarkup(delete_buttons)
+    )
+
+@app.on_callback_query(filters.regex(r"^del_btn_\d+$") & filters.user(ADMIN_USER_ID))
+async def delete_button_handler(client, callback_query):
+    try:
+        button_index = int(callback_query.data.split("_")[2])
+        data = post_cache.get(callback_query.from_user.id, {})
+        buttons_list = data.get('buttons', [])
+        
+        if 0 <= button_index < len(buttons_list):
+            deleted_button = buttons_list.pop(button_index)
+            post_cache[callback_query.from_user.id]['buttons'] = buttons_list
+            await callback_query.answer(f"✅ Deleted: {deleted_button[0]}", show_alert=True)
+            
+            # Refresh the delete menu
+            await wiz_delete_buttons(client, callback_query)
+        else:
+            await callback_query.answer("❌ Button not found", show_alert=True)
+    except Exception as e:
+        await callback_query.answer("❌ Error deleting button", show_alert=True)
+
+@app.on_callback_query(filters.regex("wiz_back_attach_file") & filters.user(ADMIN_USER_ID))
+async def wiz_back_attach_file(client, callback_query):
+    # Clear temp file data and return to attach file step
+    if callback_query.from_user.id in post_cache:
+        post_cache[callback_query.from_user.id].pop('temp_file', None)
+    
+    user_states[callback_query.from_user.id] = "WAITING_FILE_ATTACH"
+    buttons = [
+        [InlineKeyboardButton("🔙 Back", callback_data="wiz_back_to_builder")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="wiz_cancel")]
+    ]
+    await callback_query.message.edit_text(
+        "**📎 Attach File for FileShare**\n\n"
+        "Forward or upload the file you want users to download.\n"
+        "I will auto-generate a secured link and add a 'Download' button to this post.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+@app.on_callback_query(filters.regex("wiz_back_to_builder") & filters.user(ADMIN_USER_ID))
+async def wiz_back_to_builder(client, callback_query):
+    user_states[callback_query.from_user.id] = "BUILDING_POST"
+    await callback_query.message.edit_text("🔙 **Returned to Post Builder**")
+    await show_post_builder_menu(client, callback_query.from_user.id)
+
+@app.on_callback_query(filters.regex("wiz_cancel") & filters.user(ADMIN_USER_ID))
+async def wiz_cancel(client, callback_query):
+    post_cache.pop(callback_query.from_user.id, None)
+    user_states.pop(callback_query.from_user.id, None)
+    await callback_query.message.edit_text("❌ Post creation cancelled.")
+    await back_to_main(client, callback_query)
+
+# --------------------------------------------------------------------------
+# BROADCAST LOGIC (SELECTIVE)
+# --------------------------------------------------------------------------
+
+@app.on_callback_query(filters.regex("wiz_send_menu") & filters.user(ADMIN_USER_ID))
+async def wiz_send_menu(client, callback_query):
+    try:
+        # Fetch post channels
+        channels = post_channels_col.find({})
+        buttons = []
+        async for ch in channels:
+            btn_text = f"{ch.get('title', 'Channel')} 📢"
+            # Callback format: send_target_CHANNELID
+            buttons.append([InlineKeyboardButton(btn_text, callback_data=f"send_target_{ch['channel_id']}")])
+        
+        if not buttons:
+            await callback_query.answer("No post channels added! Please add post channels first.", show_alert=True)
+            return
+
+        # Add "Send to ALL" option
+        buttons.append([InlineKeyboardButton("📢 Post to All Post Channels", callback_data="send_target_ALL")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="wiz_cancel")])
+
+        await callback_query.message.edit_text(
+            "🚀 **Select Destination**\n\nWhere do you want to post this?",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception as e:
+        logger.error(f"Error in send menu: {e}")
+        await callback_query.answer("Error loading channels.", show_alert=True)
+
+@app.on_callback_query(filters.regex(r"^send_target_") & filters.user(ADMIN_USER_ID))
+async def execute_broadcast(client, callback_query):
+    target = callback_query.data.split("_")[2]
+    user_id = callback_query.from_user.id
+    data = post_cache.get(user_id)
+
+    if not data:
+        await callback_query.answer("Session expired.", show_alert=True)
+        return
+
+    await callback_query.message.edit_text("⏳ Sending...")
+
+    # Determine targets
+    target_ids = []
+    try:
+        if target == "ALL":
+            async for ch in post_channels_col.find({}):
+                target_ids.append(ch['channel_id'])
+        else:
+            target_ids.append(int(target))
+    except Exception as e:
+        logger.error(f"Error fetching targets: {e}")
+        await callback_query.message.edit_text("❌ Error fetching targets.")
+        return
+
+    # Build Markup with proper button formatting
+    markup = format_button_markup(data['buttons'])
+
+    success = 0
+    failed = 0
+
+    for chat_id in target_ids:
+        try:
+            # Send with styled text entities preserved
+            if data['type'] == "text":
+                await client.send_message(
+                    chat_id, 
+                    data['text'], 
+                    entities=data.get('entities', []),
+                    reply_markup=markup
+                )
+            elif data['type'] == "photo":
+                await client.send_photo(
+                    chat_id, 
+                    data['file_id'], 
+                    caption=data['text'],
+                    caption_entities=data.get('entities', []),
+                    reply_markup=markup
+                )
+            elif data['type'] == "video":
+                await client.send_video(
+                    chat_id, 
+                    data['file_id'], 
+                    caption=data['text'],
+                    caption_entities=data.get('entities', []),
+                    reply_markup=markup
+                )
+            elif data['type'] == "document":
+                await client.send_document(
+                    chat_id, 
+                    data['file_id'], 
+                    caption=data['text'],
+                    caption_entities=data.get('entities', []),
+                    reply_markup=markup
+                )
+            elif data['type'] == "audio":
+                await client.send_audio(
+                    chat_id, 
+                    data['file_id'], 
+                    caption=data['text'],
+                    caption_entities=data.get('entities', []),
+                    reply_markup=markup
+                )
+            success += 1
+            await asyncio.sleep(0.5) # Avoid hitting flood limits
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            # Retry once (simple logic)
+            try:
+                if data['type'] == "text":
+                    await client.send_message(
+                        chat_id, 
+                        data['text'], 
+                        entities=data.get('entities', []),
+                        reply_markup=markup
+                    )
+                elif data['type'] == "photo":
+                    await client.send_photo(
+                        chat_id, 
+                        data['file_id'], 
+                        caption=data['text'],
+                        caption_entities=data.get('entities', []),
+                        reply_markup=markup
+                    )
+                elif data['type'] == "video":
+                    await client.send_video(
+                        chat_id, 
+                        data['file_id'], 
+                        caption=data['text'],
+                        caption_entities=data.get('entities', []),
+                        reply_markup=markup
+                    )
+                elif data['type'] == "document":
+                    await client.send_document(
+                        chat_id, 
+                        data['file_id'], 
+                        caption=data['text'],
+                        caption_entities=data.get('entities', []),
+                        reply_markup=markup
+                    )
+                elif data['type'] == "audio":
+                    await client.send_audio(
+                        chat_id, 
+                        data['file_id'], 
+                        caption=data['text'],
+                        caption_entities=data.get('entities', []),
+                        reply_markup=markup
+                    )
+                success += 1
+            except:
+                failed += 1
+        except Exception as e:
+            logger.error(f"Failed to send to {chat_id}: {e}")
+            failed += 1
+
+    # Clear Cache
+    post_cache.pop(user_id, None)
+    user_states.pop(user_id, None)
+
+    result_text = (
+        f"✅ **Broadcasting Complete**\n\n"
+        f"Successful: {success}\n"
+        f"Failed: {failed}"
+    )
+    await client.send_message(user_id, result_text)
+    # Show admin menu again
+    await admin_start(client, callback_query.message)
+
+# --------------------------------------------------------------------------
+# USER SIDE & FORCE SUB LOGIC
+# --------------------------------------------------------------------------
+
+@app.on_message(filters.command("start"))
+async def user_start_handler(client, message):
+    # If it's a plain /start
+    if len(message.command) == 1:
+        buttons = [
+            [InlineKeyboardButton("ℹ️ About", callback_data="user_about"),
+             InlineKeyboardButton("🆘 Help", callback_data="user_help")],
+            [InlineKeyboardButton("❌ Close", callback_data="user_close")]
+        ]
+        await message.reply(
+            "**👋 Welcome to FileShare Bot!**\n\n"
+            "I can help you store and share files with forced subscription protection.\n"
+            "Use the buttons below to learn more.",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # If it's /start token
+    token = message.command[1]
+    
+    # 1. Fetch File Info
+    try:
+        file_data = await fileshares_col.find_one({"token": token})
+        if not file_data:
+            await message.reply("❌ **Invalid or expired link.**")
+            return
+    except Exception as e:
+        logger.error(f"DB Error fetching file: {e}")
+        await message.reply("❌ System error. Please try again later.")
+        return
+
+    # 2. Check Forced Subscription (FSub)
+    try:
+        channels = must_join_channels_col.find({})
+        not_joined_channels = []
+
+        async for ch in channels:
+            is_member = await is_user_member(message.from_user.id, ch['channel_id'])
+            if not is_member:
+                # If username exists use that, else try to make a link
+                invite_link = f"https://t.me/{ch['username']}" if ch.get('username') else None
+                # If we don't have username, we can't link easily without export_invite_link which requires rights
+                # For this simple bot, we assume admin added public channels or we have usernames
+                if invite_link:
+                    not_joined_channels.append((ch['title'], invite_link))
+
+        if not_joined_channels:
+            # Build Join Buttons
+            buttons = []
+            for title, link in not_joined_channels:
+                buttons.append([InlineKeyboardButton(f"Join {title}", url=link)])
+            
+            # Add "Try Again" button which re-triggers the same start command
+            # Deep linking format: https://t.me/bot?start=token
+            bot_username = (await client.get_me()).username
+            url_retry = f"https://t.me/{bot_username}?start={token}"
+            buttons.append([InlineKeyboardButton("✅ I Joined", url=url_retry)])
+
+            await message.reply(
+                "⚠️ **You must join our channels to access this file:**",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+    except Exception as e:
+        logger.error(f"Error in FSub check: {e}")
+        # Fail open or closed? Let's fail closed for security but notify user
+        await message.reply("❌ Error verifying subscription status.")
+        return
+
+    # 3. Send File (If subscribed)
+    try:
+        caption = file_data.get("caption", "")
+        f_type = file_data.get("file_type")
+        f_id = file_data.get("file_id")
+
+        if f_type == "document":
+            await client.send_document(message.chat.id, f_id, caption=caption, protect_content=True)
+        elif f_type == "video":
+            await client.send_video(message.chat.id, f_id, caption=caption, protect_content=True)
+        elif f_type == "photo":
+            await client.send_photo(message.chat.id, f_id, caption=caption, protect_content=True)
+        elif f_type == "audio":
+            await client.send_audio(message.chat.id, f_id, caption=caption, protect_content=True)
+        else:
+            await message.reply("❌ Unknown file type.")
+
+    except Exception as e:
+        logger.error(f"Error sending file: {e}")
+        await message.reply("❌ Error sending file. It might have been deleted from Telegram servers.")
+
+# USER CALLBACKS
+@app.on_callback_query(filters.regex("user_about"))
+async def user_about(client, callback_query):
+    await callback_query.answer("Made with ❤️ by Antigravity", show_alert=True)
+
+@app.on_callback_query(filters.regex("user_help"))
+async def user_help(client, callback_query):
+    await callback_query.answer("Contact the admin for support.", show_alert=True)
+
+@app.on_callback_query(filters.regex("user_close"))
+async def user_close(client, callback_query):
+    await callback_query.message.delete()
+
+# --------------------------------------------------------------------------
+# MAIN EXECUTION
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# MAIN EXECUTION
+# --------------------------------------------------------------------------
+
+# We need to make the web server runner and site accessible to gracefully stop it.
+# We'll modify start_web_server to return the runner and site objects.
+
+# Update the definition of start_web_server
+async def start_web_server():
+    """Starts the aiohttp web server and returns runner and site."""
+    server = web.Application()
+    server.router.add_get("/", health_check)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    # Bind to 0.0.0.0 so outside world can access (required by Render)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Web server running on port {PORT}")
+    return runner, site # Return the runner and site
+
+# Add a function to handle graceful shutdown
+async def shutdown(loop, runner, site):
+    """Gracefully shuts down the bot, web server, and cancels tasks."""
+    logger.info("Shutdown initiated...")
+    
+    # 1. Stop Telegram Bot (Pyrogram)
+    if app.is_running:
+        logger.info("Stopping Pyrogram Client...")
         await app.stop()
         
-        LOGGER.info("✅ Shutdown complete!")
+    # 2. Stop Aiohttp Web Server
+    if site and runner:
+        logger.info("Stopping aiohttp Web Server...")
+        await site.stop()
+        await runner.cleanup()
         
-    except Exception as e:
-        LOGGER.critical("❌ FATAL ERROR in start_bot: %s", e, exc_info=True)
-        raise
-
-
-def main():
-    """Main entry point."""
-    exit_code = 0
+    # 3. Cancel outstanding tasks (excluding the main loop task)
+    tasks = [t for t in asyncio.all_tasks(loop=loop) if t is not asyncio.current_task(loop=loop)]
+    for task in tasks:
+        task.cancel()
     
-    try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(start_bot())
-        
-    except KeyboardInterrupt:
-        LOGGER.info("🛑 Bot stopped by user (Ctrl+C)")
-        exit_code = 0  # Graceful shutdown
-    except Exception as e:
-        LOGGER.critical("❌ Fatal error: %s", e, exc_info=True)
-        exit_code = 1  # Error - should restart
-    finally:
-        LOGGER.info("👋 Bot shutdown complete")
-        
-    # Return exit code for start.sh to handle
-    import sys
-    sys.exit(exit_code)
+    logger.info("Shutdown complete.")
 
+
+async def main():
+    # Start Web Server (Keep Alive) and get runner/site objects
+    runner, site = await start_web_server()
+    
+    # Start Bot
+    logger.info("Starting Bot...")
+    await app.start()
+    
+    # Keep running until cancelled (e.g., SIGTERM on Render)
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        # This is expected when an external signal triggers shutdown
+        pass
+    except KeyboardInterrupt:
+        # For local testing
+        pass
+    finally:
+        # Execute the shutdown procedure
+        await shutdown(asyncio.get_event_loop(), runner, site)
 
 if __name__ == "__main__":
-    main()
+    # Run the async main loop
+    loop = asyncio.get_event_loop()
+    
+    # Add a signal handler for graceful termination (e.g. SIGINT/SIGTERM)
+    # This is especially crucial for deployment on platforms like Render.
+    try:
+        # SIGINT is typically Ctrl+C; SIGTERM is used by docker/orchestrators
+        loop.add_signal_handler(
+            signal.SIGINT, 
+            lambda: loop.stop()
+        )
+        loop.add_signal_handler(
+            signal.SIGTERM, 
+            lambda: loop.stop()
+        )
+    except NotImplementedError:
+        # Windows doesn't support signal handlers in this way
+        logger.warning("Signal handlers not supported on this platform.")
+
+    #import signal # Import the signal module
+    
+    try:
+        # Start the main coroutine
+        loop.run_until_complete(main())
+    finally:
+        # After the main coroutine finishes (due to cancellation/stop),
+        # close the loop and clean up.
+        logger.info("Closing loop...")
+        loop.close()
+
+# Note: You will need to add `import signal` at the top of your file
