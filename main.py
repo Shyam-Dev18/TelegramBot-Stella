@@ -154,7 +154,8 @@ async def health_check(request):
 async def start_web_server():
     """Starts the aiohttp web server."""
     server = web.Application()
-    server.router.add_get("/", health_check)
+    server.router.add_get("/health", health_check)
+    #server.router.add_get("/", health_check)
     runner = web.AppRunner(server)
     await runner.setup()
     # Bind to 0.0.0.0 so outside world can access (required by Render)
