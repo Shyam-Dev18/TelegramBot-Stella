@@ -1240,13 +1240,13 @@ async def user_start_handler(client, message):
         f_id = file_data.get("file_id")
 
         if f_type == "document":
-            await client.send_document(message.chat.id, f_id, caption=caption, protect_content=True)
+            await client.send_document(message.chat.id, f_id, caption=caption, protect_content=False)
         elif f_type == "video":
-            await client.send_video(message.chat.id, f_id, caption=caption, protect_content=True)
+            await client.send_video(message.chat.id, f_id, caption=caption, protect_content=False)
         elif f_type == "photo":
-            await client.send_photo(message.chat.id, f_id, caption=caption, protect_content=True)
+            await client.send_photo(message.chat.id, f_id, caption=caption, protect_content=False)
         elif f_type == "audio":
-            await client.send_audio(message.chat.id, f_id, caption=caption, protect_content=True)
+            await client.send_audio(message.chat.id, f_id, caption=caption, protect_content=False)
         else:
             await message.reply("❌ Unknown file type.")
 
